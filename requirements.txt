@@ -10,3 +10,5 @@ faiss-cpu
 pdfplumber
 gtts
 whisper
+PyJWT>=2.8.0
+
