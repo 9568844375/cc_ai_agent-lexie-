@@ -12,5 +12,6 @@ gtts
 whisper
 PyJWT>=2.8.0
 langchain-huggingface
-
-
+sentence-transformers
+faiss-cpu
+aiofiles
