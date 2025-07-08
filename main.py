@@ -1,34 +1,36 @@
 # Lexi AI Agent – Main FastAPI Server
-from pydantic import BaseModel
-class ChatRequest(BaseModel):
-    user_id: str
-    message: str
 
-import sys
+from pydantic import BaseModel
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
 import os
+import sys
+from datetime import datetime
+import redis.asyncio as redis
+
+# Extend sys.path to allow imports
 sys.path.append(os.path.dirname(__file__))
 
-from fastapi import FastAPI, Request, Depends, HTTPException, Header  # Include Header for token
-from fastapi.middleware.cors import CORSMiddleware
-from auth import get_user_role  # Role-based authentication
-from chat_agent import generate_response  # ChatGPT response generator
-from db import get_user_data, save_flag_to_db  # MongoDB functions
-from routes.admin import admin_router  # ✅ This will fix the error
+from auth import get_user_role
+from chat_agent import generate_response
+from db import get_user_data, save_flag_to_db
+from routes.admin import admin_router
 from routes.chat import router as chat_router
-from langchain_agent.vector_store import load_documents_and_embed
-from vector_store.load_documents import load_pdfs
 from routes.voice_chat import router as voice_router
-import uvicorn
-import redis.asyncio as redis
-import asyncio
-from datetime import datetime
-
-from vector_store.index_faiss import search, add_to_index
 from vector_store.embedder import get_embedding
+from vector_store.index_faiss import search, add_to_index
+from dotenv import load_dotenv
 
+load_dotenv()  # ✅ Load .env file for local use
+# 🚀 App init
 app = FastAPI()
-redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
+# ✅ Redis connection for both local and Railway
+redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+
+# CORS settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -37,6 +39,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 🧾 Pydantic request model
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+
+# 🚦 Rate Limiting
 async def rate_limit(user_id: str):
     key = f"rate:{user_id}"
     count = await redis_client.incr(key)
@@ -45,6 +53,7 @@ async def rate_limit(user_id: str):
     if count > 20:
         raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
 
+# 🚨 Suspicious activity logging
 async def log_suspicious_activity(user_id: str, message: str, role: str):
     if any(term in message.lower() for term in ["password", "admin access", "student data"]):
         log = {
@@ -54,8 +63,9 @@ async def log_suspicious_activity(user_id: str, message: str, role: str):
             "timestamp": datetime.utcnow().isoformat()
         }
         await redis_client.lpush("suspicious_logs", str(log))
-        await save_flag_to_db(log)  # Save to MongoDB permanently
+        await save_flag_to_db(log)
 
+# 🧠 Chat memory handling
 async def store_chat_memory(user_id: str, user_query: str, lexi_reply: str):
     chat_log = {
         "timestamp": datetime.utcnow().isoformat(),
@@ -69,6 +79,7 @@ async def get_chat_memory(user_id: str):
     history = await redis_client.lrange(f"chat_memory:{user_id}", 0, 4)
     return "\n\n".join(history)
 
+# 🔍 View & clear memory endpoints
 @app.get("/memory/{user_id}")
 async def view_user_memory(user_id: str):
     memory = await redis_client.lrange(f"chat_memory:{user_id}", 0, 4)
@@ -79,10 +90,12 @@ async def clear_user_memory(user_id: str):
     await redis_client.delete(f"chat_memory:{user_id}")
     return {"status": "cleared", "user_id": user_id}
 
+# 👇 Include routers
 app.include_router(admin_router)
 app.include_router(chat_router)
 app.include_router(voice_router)
 
+# 💬 Main chat endpoint
 @app.post("/chat")
 async def chat_with_lexi(payload: ChatRequest, role: str = Depends(get_user_role)):
     user_id = payload.user_id
@@ -102,29 +115,25 @@ async def chat_with_lexi(payload: ChatRequest, role: str = Depends(get_user_role
         context_data = await get_user_data(role, user_id)
         await redis_client.set(cache_key, str(context_data), ex=300)
 
-    # 🧠 Chat memory
     chat_history = await get_chat_memory(user_id)
 
-    # 🔍 Vector Search
     query_embedding = get_embedding(user_query)
-    related_docs = search(query_embedding, k=3)  # You can change k=3 to control match count
+    related_docs = search(query_embedding, k=3)
 
-    # 🧠 Combine memory + vector matches + user input
     enriched_query = f"{chat_history}\n\nTop Related Docs:\n{'. '.join(related_docs)}\n\nUser: {user_query}"
 
-    # 🤖 Generate final response
     reply = await generate_response(enriched_query, context_data, role)
 
-    # 🗾 Store chat history
     await store_chat_memory(user_id, user_query, reply)
 
     return {"response": reply}
 
+# 🧠 Startup tasks
 @app.on_event("startup")
 def on_startup():
     import os
 
-    # 🥹 Clean temp/ folder
+    # Clean temp files
     temp_folder = "temp"
     if os.path.exists(temp_folder):
         for filename in os.listdir(temp_folder):
@@ -132,7 +141,7 @@ def on_startup():
             if os.path.isfile(file_path):
                 os.remove(file_path)
 
-    # 🧠 Embed static documents into FAISS
+    # Load and embed some sample documents
     def load_documents_and_embed():
         documents = [
             "Physics assignment is due July 10.",
@@ -143,12 +152,14 @@ def on_startup():
             emb = get_embedding(doc)
             add_to_index(doc, emb)
 
-    # 📅 Load and embed
     load_documents_and_embed()
 
+# 🔗 Root endpoint
 @app.get("/")
 async def root():
     return {"message": "Welcome to Lexi AI Agent 🚀", "docs": "/docs"}
 
+# 🔥 Run locally (not used on Railway)
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
